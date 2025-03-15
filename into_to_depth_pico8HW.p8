@@ -1,0 +1,935 @@
+pico-8 cartridge // http://www.pico-8.com
+version 42
+__lua__
+----------------------------------------------------------------
+-- GLOBALS & SETUP
+----------------------------------------------------------------
+tile_size = 8
+
+-- Define our map dimensions (in tiles)
+map_width  = 32
+map_height = 26
+map_min_x  = 1
+map_max_x  = map_width
+map_min_y  = 1
+map_max_y  = map_height
+
+-- Choose which row becomes “ground” (first layer of ground)
+ground_row = 10
+
+-- Player spawns above a flat ground in the center
+player = {
+  x = (map_width * tile_size)/2 - 4,
+  y = (ground_row - 2) * tile_size,
+  vx = 0, vy = 0,
+  width = 8, height = 8,
+  facing = 1,
+  on_ground = false,
+  anim_timer = 0,
+  anim_frame = 1,
+  state = "idle",
+  bug_spray = 2,
+  did_jump = false
+}
+
+-- Place the diamond at the bottom center (just above the very bottom)
+diamond = {
+  x = (map_width * tile_size)/2 - 4,
+  y = (map_max_y - 1) * tile_size,
+  width = 8, height = 8,
+  collected = false
+}
+
+gravity    = 0.2
+jump_speed = -2.0
+move_speed = 1
+
+-- Our manually built map grid (1 = block, 0 = empty)
+map_grid = {}
+
+-- Enemies and items tables
+bugs  = {}
+traps = {}
+items = {}
+
+-- Bug spray effect animations (for visual feedback)
+bug_spray_effects = {}
+
+camera_intro_timer = 0
+camera_y_offset = 0
+timer = 0
+best_time = nil
+
+game_state = "intro"
+
+-- Jump buffer to make jumps more responsive
+jump_buffer = 0
+jump_buffer_max = 5  -- Number of frames to buffer a jump
+
+----------------------------------------------------------------
+-- INIT MAP: Build the grid with a flat ground
+----------------------------------------------------------------
+function init_map()
+  map_grid = {}
+  for i=1, map_width do
+    map_grid[i] = {}
+    for j=1, map_height do
+      if j >= ground_row then
+        map_grid[i][j] = 1  -- concrete block
+      else
+        map_grid[i][j] = 0
+      end
+    end
+  end
+end
+
+----------------------------------------------------------------
+-- DRAW MAP: Draw sky, ground and sub‑ground using specific sprites
+----------------------------------------------------------------
+function draw_map()
+  for i = map_min_x, map_max_x do
+    for j = map_min_y, map_max_y do
+      local x = (i-1)*tile_size
+      local y = (j-1)*tile_size
+      local cell = map_grid[i][j]
+      if cell and cell > 0 then
+        if j < ground_row then
+          -- Sky: use sprite 57
+          spr(57, x, y)
+        elseif j == ground_row then
+          -- Ground (first layer): alternate sprites 50 and 51
+          if (i + j) % 2 == 0 then
+            spr(50, x, y)
+          else
+            spr(51, x, y)
+          end
+        else
+          -- Sub‑ground (below ground): alternate sprites 52 and 53
+          if (i + j) % 2 == 0 then
+            spr(52, x, y)
+          else
+            spr(53, x, y)
+          end
+        end
+      end
+    end
+  end
+end
+
+----------------------------------------------------------------
+-- SPAWN ENEMIES & ITEMS (Randomly placed on existing blocks)
+----------------------------------------------------------------
+function spawn_enemies_and_items()
+  bugs  = {}
+  traps = {}
+  items = {}
+  bug_spray_effects = {}
+  
+  -- Increased item count to 5..7
+  local item_count = 5 + flr(rnd(3))
+  
+  -- TWO additional traps on the ground (one block higher than the ground)
+  for i=1,2 do
+    local gx = flr(rnd(map_width - 2)) + 1
+    add(traps, {
+      x = gx * tile_size,
+      y = (ground_row - 2) * tile_size,
+      width = 8, height = 8,
+      timer = 0,
+      interval = flr(rnd(120)) + 90,
+      visible = true
+    })
+  end
+
+  -- A couple of traps and one bug on top
+  for i=1,2 do
+    add(traps, {
+      x = rnd(map_width*tile_size), y = 0,
+      width = 8, height = 8,
+      timer = 0,
+      interval = flr(rnd(120)) + 90,
+      visible = true
+    })
+  end
+  for i=1,2 do
+    add(bugs, {
+      x = rnd(map_width*tile_size), y = 0,
+      width = 8, height = 8,
+      vx = 0, vy = 0,
+      visible = true
+    })
+  end
+  
+  -- More hidden enemies
+  local hidden_bug_count  = 50
+  local hidden_trap_count = 30
+  for i=1, hidden_bug_count do
+    local bx, by = pick_random_block()
+    add(bugs, {
+      x = (bx-1)*tile_size, y = (by-1)*tile_size,
+      width = 8, height = 8,
+      vx = 0, vy = 0,
+      visible = false,
+      block_x = bx, block_y = by
+    })
+  end
+  for i=1, hidden_trap_count do
+    local bx, by = pick_random_block()
+    add(traps, {
+      x = (bx-1)*tile_size, y = (by-1)*tile_size,
+      width = 8, height = 8,
+      timer = 0,
+      interval = flr(rnd(120)) + 90,
+      visible = false,
+      block_x = bx, block_y = by
+    })
+  end
+  
+  -- More bug spray items (unchanged type, just bigger count)
+  for i=1, item_count do
+    local bx, by = pick_random_block()
+    add(items, {
+      x = (bx-1)*tile_size, y = (by-1)*tile_size,
+      width = 8, height = 8,
+      type = "spray",
+      visible = false,
+      block_x = bx, block_y = by
+    })
+  end
+end
+
+----------------------------------------------------------------
+-- PICK RANDOM BLOCK: Choose a random block within the ground area
+----------------------------------------------------------------
+function pick_random_block()
+  local attempts = 0
+  local max_attempts = 500
+  while attempts < max_attempts do
+    attempts += 1
+    local bx = map_min_x + flr(rnd(map_max_x - map_min_x + 1))
+    local by = ground_row + flr(rnd(map_max_y - ground_row + 1))
+    if map_grid[bx] and map_grid[bx][by] == 1 then
+      return bx, by
+    end
+  end
+  return map_min_x, ground_row
+end
+
+----------------------------------------------------------------
+-- GAME INIT: Set up the map, player, enemies, etc.
+----------------------------------------------------------------
+function init_game()
+  init_map()
+  spawn_enemies_and_items()
+  timer = 0
+  game_state = "intro"
+  
+  player.x = (map_width * tile_size)/2 - player.width/2
+  player.y = (ground_row - 2) * tile_size
+  player.vx = 0
+  player.vy = 0
+  player.bug_spray = 2
+  player.state = "idle"
+  player.did_jump = false
+  
+  camera_intro_timer = 0
+  camera_y_offset = player.y - 64
+  music(0)
+end
+
+----------------------------------------------------------------
+-- MAP COLLISION: Check for collision against blocks and boundaries
+----------------------------------------------------------------
+function map_collision(x, y, w, h)
+  local left   = flr(x / tile_size) + 1
+  local right  = flr((x + w - 1) / tile_size) + 1
+  local top    = flr(y / tile_size) + 1
+  local bottom = flr((y + h - 1) / tile_size) + 1
+
+  for i = left, right do
+    for j = top, bottom do
+      if i < map_min_x or i > map_max_x then
+        return true
+      end
+      if j > map_max_y then
+        return true
+      end
+      if j < map_min_y then
+        -- allow falling from above
+      else
+        if map_grid[i] and map_grid[i][j] and map_grid[i][j] > 0 then
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
+----------------------------------------------------------------
+-- UPDATE PHYSICS (for player, bugs, traps, etc.)
+----------------------------------------------------------------
+function update_physics(obj)
+  -- Apply gravity
+  obj.vy += gravity
+
+  -- Update vertical position
+  local new_y = obj.y + obj.vy
+
+  -- Check for vertical collisions
+  if obj.vy > 0 then
+    -- Falling down
+    if map_collision(obj.x, new_y, obj.width, obj.height) then
+      -- Land on top of a block
+      obj.y = flr((new_y + obj.height) / tile_size) * tile_size - obj.height
+      obj.vy = 0
+      if obj == player then
+        player.on_ground = true
+        player.did_jump = false
+      end
+    else
+      obj.y = new_y
+      if obj == player then
+        player.on_ground = false
+      end
+    end
+  else
+    -- Moving upward (jumping)
+    if map_collision(obj.x, new_y, obj.width, obj.height) then
+      -- Hit ceiling
+      obj.vy = 0
+    else
+      obj.y = new_y
+    end
+  end
+
+  -- Update horizontal position
+  local new_x = obj.x + obj.vx
+  if not map_collision(new_x, obj.y, obj.width, obj.height) then
+    obj.x = new_x
+  else
+    obj.vx = 0
+  end
+end
+
+----------------------------------------------------------------
+-- CLAMP PLAYER POSITION INSIDE THE VALID REGION
+----------------------------------------------------------------
+function clamp_player_position()
+  local px_min = map_min_x * tile_size
+  local px_max = (map_max_x + 1)*tile_size - player.width
+  local py_min = map_min_y * tile_size
+  local py_max = (map_max_y + 1)*tile_size - player.height
+  if player.x < px_min then player.x = px_min end
+  if player.x > px_max then player.x = px_max end
+  if player.y < py_min then player.y = py_min end
+  if player.y > py_max then player.y = py_max end
+end
+
+----------------------------------------------------------------
+-- COLLISION BETWEEN OBJECTS
+----------------------------------------------------------------
+function collide(a, b)
+  return not (
+    a.x + a.width < b.x or
+    a.x > b.x + b.width or
+    a.y + a.height < b.y or
+    a.y > b.y + b.height
+  )
+end
+
+----------------------------------------------------------------
+-- PLAYER INPUT: 
+--   left/right = arrow keys
+--   jump = c/z => btnp(6)
+--   mine = x => btnp(5)
+--   spray = uo => btnp(2)
+----------------------------------------------------------------
+function player_input()
+  -- Move left/right with arrow keys
+  if btn(0) then
+    player.vx = -move_speed
+    player.facing = -1
+    player.state = "walking"
+  elseif btn(1) then
+    player.vx = move_speed
+    player.facing = 1
+    player.state = "walking"
+  else
+    player.vx = 0
+    if player.state == "walking" then
+      player.state = "idle"
+    end
+  end
+
+  -- JUMP FIX: Improved jump mechanics with buffer
+  if btnp(4) then
+    jump_buffer = jump_buffer_max  -- Set jump buffer when jump is pressed
+  end
+
+  if jump_buffer > 0 and player.on_ground then
+    player.vy = jump_speed
+    player.on_ground = false
+    player.did_jump = true
+    jump_buffer = 0  -- Reset jump buffer after jumping
+  end
+
+  -- Decrement jump buffer
+  if jump_buffer > 0 then
+    jump_buffer -= 1
+  end
+
+  -- Mine (X => btnp(5))
+  if btnp(5) then
+    player.state = "mining"
+    mine_block()
+  end
+
+  -- Bug spray (up => btnp(2))
+  if btnp(2) then
+    use_bug_spray()
+  end
+end
+
+----------------------------------------------------------------
+-- MINING: Remove a block adjacent to the player
+----------------------------------------------------------------
+function mine_block()
+  local mx, my
+  -- If up arrow => mine block above
+  if btn(2) then
+    mx = flr((player.x + player.width/2) / tile_size) + 1
+    my = flr((player.y - 1) / tile_size) + 1
+  -- If down arrow => mine block below
+  elseif btn(3) then
+    mx = flr((player.x + player.width/2) / tile_size) + 1
+    my = flr((player.y + player.height + 1) / tile_size) + 1
+  else
+    -- Otherwise mine left/right based on facing
+    if player.facing == 1 then
+      mx = flr((player.x + player.width + 1) / tile_size) + 1
+    else
+      mx = flr((player.x - 1) / tile_size) + 1
+    end
+    my = flr((player.y + player.height/2) / tile_size) + 1
+  end
+
+  if map_grid[mx] and map_grid[mx][my] and map_grid[mx][my] > 0 then
+    map_grid[mx][my] = 0  -- Mined => invisible
+    reveal_hidden(mx, my)
+  end
+end
+
+function reveal_hidden(mx, my)
+  for bug in all(bugs) do
+    if bug.block_x == mx and bug.block_y == my then
+      bug.visible = true
+    end
+  end
+  for trap in all(traps) do
+    if trap.block_x == mx and trap.block_y == my then
+      trap.visible = true
+    end
+  end
+  for item in all(items) do
+    if item.block_x == mx and item.block_y == my then
+      item.visible = true
+    end
+  end
+end
+
+----------------------------------------------------------------
+-- BUG SPRAY & ANIMATION
+----------------------------------------------------------------
+function use_bug_spray()
+  if player.bug_spray > 0 then
+    player.bug_spray -= 1
+    -- Add a spray effect (lasting 5 frames) from the player's center
+    local effect = {
+      x = player.x + player.width/2,
+      y = player.y + player.height/2,
+      dir = player.facing,
+      timer = 5
+    }
+    add(bug_spray_effects, effect)
+
+    local spray_range = 16
+    local cx = player.x + player.width/2
+    local cy = player.y + player.height/2
+    for i = #bugs, 1, -1 do
+      local bug = bugs[i]
+      if bug.visible then
+        -- Check if bug is within spray_range horizontally & 8 px vertically
+        if player.facing == 1 then
+          if bug.x >= cx and bug.x <= cx + spray_range and abs(bug.y - cy) < 8 then
+            del(bugs, bug)
+          end
+        else
+          if bug.x + bug.width <= cx and bug.x + bug.width >= cx - spray_range and abs(bug.y - cy) < 8 then
+            del(bugs, bug)
+          end
+        end
+      end
+    end
+  end
+end
+
+function update_bug_spray_effects()
+  for effect in all(bug_spray_effects) do
+    effect.timer -= 1
+    if effect.timer <= 0 then
+      del(bug_spray_effects, effect)
+    end
+  end
+end
+
+function draw_bug_spray_effects()
+  for effect in all(bug_spray_effects) do
+    if effect.dir == 1 then
+      line(effect.x, effect.y, effect.x + 16, effect.y, 11) -- green
+    else
+      line(effect.x, effect.y, effect.x - 16, effect.y, 11) -- green
+    end
+  end
+end
+
+----------------------------------------------------------------
+-- PLAYER ANIMATION
+----------------------------------------------------------------
+function update_player_anim()
+  player.anim_timer += 1
+  if player.anim_timer > 10 then
+    player.anim_frame = (player.anim_frame % 2) + 1
+    player.anim_timer = 0
+  end
+end
+
+----------------------------------------------------------------
+-- ENEMIES & TRAPS
+----------------------------------------------------------------
+function update_bugs()
+  for bug in all(bugs) do
+    if bug.visible then
+      -- If on same horizontal row (within ~8 px) and no block in between
+      if abs(bug.y - player.y) < 8 and clear_line(bug.x, bug.y, player.x, player.y) then
+        if bug.x < player.x then
+          bug.vx = 0.5
+        else
+          bug.vx = -0.5
+        end
+      else
+        -- Wander logic
+        bug.wander_timer = (bug.wander_timer or 0) + 1
+        if bug.wander_timer > 30 then
+          bug.vx = -(bug.vx or 0.5)
+          bug.wander_timer = 0
+        end
+      end
+      update_physics(bug)
+      
+      -- Collide => kill or game over
+      if collide(player, bug) then
+        -- If stepping on bug from above
+        if (player.y + player.height - bug.y) < 4 and player.vy > 0 and player.did_jump then
+          del(bugs, bug)
+          player.vy = jump_speed/2
+        else
+          game_over()
+        end
+      end
+    end
+  end
+end
+
+function clear_line(x1, y1, x2, y2)
+  local minx = min(x1, x2)
+  local maxx = max(x1, x2)
+  local row = flr(y1/tile_size) + 1
+  for i = flr(minx/tile_size) + 1, flr(maxx/tile_size) + 1 do
+    if i >= map_min_x and i <= map_max_x and row >= map_min_y and row <= map_max_y then
+      if map_grid[i][row] and map_grid[i][row] > 0 then
+        return false
+      end
+    end
+  end
+  return true
+end
+
+function update_traps()
+  for trap in all(traps) do
+    if trap.visible then
+      trap.timer = trap.timer + 1
+      if trap.timer > trap.interval then
+        trap.timer = 0
+        fire_laser(trap)
+      end
+    end
+  end
+end
+
+function fire_laser(trap)
+  local dir = flr(rnd(4))
+  trap.last_dir = dir
+  trap.laser_timer = 5
+  if dir == 0 then
+    local ly1 = trap.y
+    local lx_start = trap.x + tile_size
+    local lx_end = 512
+    if rects_overlap(player.x, player.y, player.width, player.height,
+                     lx_start, ly1, lx_end - lx_start, tile_size) then
+      game_over()
+    end
+  elseif dir == 1 then
+    local ly1 = trap.y
+    local lx_start = 0
+    local lx_end = trap.x
+    if rects_overlap(player.x, player.y, player.width, player.height,
+                     lx_start, ly1, lx_end - lx_start, tile_size) then
+      game_over()
+    end
+  elseif dir == 2 then
+    local lx = trap.x + 3
+    local ly_start = trap.y + tile_size
+    local ly_end = 512
+    if rects_overlap(player.x, player.y, player.width, player.height,
+                     lx, ly_start, tile_size, ly_end - ly_start) then
+      game_over()
+    end
+  else
+    local lx = trap.x + 3
+    local ly_start = 0
+    local ly_end = trap.y
+    if rects_overlap(player.x, player.y, player.width, player.height,
+                     lx, ly_start, tile_size, ly_end - ly_start) then
+      game_over()
+    end
+  end
+end
+
+function rects_overlap(ax, ay, aw, ah, bx, by, bw, bh)
+  return not (ax + aw < bx or ax > bx + bw or ay + ah < by or ay > by + bh)
+end
+
+function update_items()
+  for item in all(items) do
+    if item.visible and collide(player, item) then
+      if item.type == "spray" then
+        player.bug_spray += 1
+      end
+      del(items, item)
+    end
+  end
+end
+
+----------------------------------------------------------------
+-- GAME OVER / VICTORY
+----------------------------------------------------------------
+function game_over()
+  player.state = "dying"
+  game_state = "gameover"
+end
+
+function check_win()
+  if collide(player, diamond) then
+    game_state = "victory"
+    if best_time == nil or timer < best_time then
+      best_time = timer
+    end
+  end
+end
+
+function reset_game()
+  init_game()
+end
+
+----------------------------------------------------------------
+-- INTRO ANIMATION
+----------------------------------------------------------------
+function update_intro()
+  local intro_total = 120
+  local half_intro = intro_total / 2
+  camera_intro_timer += 1
+  local y_start = player.y - 64
+  local y_end = diamond.y - 64
+  if camera_intro_timer <= half_intro then
+    local t = camera_intro_timer / half_intro
+    camera_y_offset = y_start + (y_end - y_start)*t
+  elseif camera_intro_timer <= intro_total then
+    local t = (camera_intro_timer - half_intro) / half_intro
+    camera_y_offset = y_end + (y_start - y_end)*t
+  else
+    camera_y_offset = player.y - 64
+    game_state = "playing"
+  end
+end
+
+----------------------------------------------------------------
+-- MAIN LOOP
+----------------------------------------------------------------
+function _init()
+  init_game()
+end
+
+function _update()
+  if game_state == "intro" then
+    update_intro()
+  elseif game_state == "playing" then
+    timer += 1
+    player_input()
+    update_physics(player)
+    clamp_player_position()
+    update_player_anim()
+    update_bugs()
+    update_traps()
+    update_items()
+    update_bug_spray_effects()
+    check_win()
+  elseif game_state == "gameover" or game_state == "victory" then
+    -- Press any jump button (here we reuse button 6 or 4/5 if you want)
+    if btnp(6) or btnp(4) or btnp(5) then
+      reset_game()
+    end
+  end
+end
+
+function _draw()
+  cls(0)
+  local desired_cx, desired_cy
+  if game_state == "intro" then
+    desired_cx = player.x - 64
+    desired_cy = camera_y_offset
+  else
+    desired_cx = player.x - 64
+    desired_cy = player.y - 64
+  end
+
+  local cam_min_x = map_min_x * tile_size
+  local cam_max_x = (map_max_x + 1)*tile_size - 128
+  local cam_min_y = map_min_y * tile_size
+  local cam_max_y = (map_max_y + 1)*tile_size - 128
+  local cam_x = mid(cam_min_x, desired_cx, cam_max_x)
+  local cam_y = mid(cam_min_y, desired_cy, cam_max_y)
+  camera(cam_x, cam_y)
+
+  draw_map()
+
+  -- Draw diamond with sprite 18
+  spr(18, diamond.x, diamond.y)
+
+  -- Items (bug spray pickups)
+  for item in all(items) do
+    if item.visible then
+      spr(16, item.x, item.y)
+    end
+  end
+
+  -- Bugs: left-facing = sprite 8, right-facing = sprite 10
+  for bug in all(bugs) do
+    if bug.visible then
+      local bug_sprite = (bug.vx < 0) and 8 or 10
+      spr(bug_sprite, bug.x, bug.y)
+    end
+  end
+
+  -- Traps (sprite 9), plus laser lines
+  for trap in all(traps) do
+    if trap.visible then
+      spr(9, trap.x, trap.y)
+      if trap.laser_timer and trap.laser_timer > 0 then
+        trap.laser_timer -= 1
+        local d = trap.last_dir
+        if d == 0 then
+          line(trap.x + tile_size, trap.y + 3, 512, trap.y + 3, 8)
+        elseif d == 1 then
+          line(0, trap.y + 3, trap.x, trap.y + 3, 8)
+        elseif d == 2 then
+          line(trap.x + 3, trap.y + tile_size, trap.x + 3, 512, 8)
+        else
+          line(trap.x + 3, trap.y, trap.x + 3, 0, 8)
+        end
+      end
+    end
+  end
+
+  -- Bug spray effect lines (green)
+  draw_bug_spray_effects()
+
+  -- Player sprite
+  local pspr = 1
+  if player.state == "idle" then
+    pspr = (player.anim_frame == 1) and 1 or 2
+  elseif player.state == "walking" then
+    pspr = (player.anim_frame == 1) and 3 or 4
+  elseif player.state == "mining" then
+    pspr = 5
+  elseif player.state == "dying" then
+    pspr = 6
+  end
+  spr(pspr, player.x, player.y)
+
+  camera()
+  rectfill(0,0,127,7,0)
+  print("time:" .. (timer/30) .. "s", 2, 2, 7)
+  print("best:" .. (best_time and best_time/30 or "N/A"), 50, 2, 7)
+  print("diamond depth:" .. diamond.y/tile_size, 90, 2, 7)
+  print("player depth:" .. (player.y+player.height)/tile_size, 2, 120, 7)
+  print("spray:" .. player.bug_spray, 2, 112, 7)
+
+  if game_state == "gameover" then
+    print("GAME OVER! Press [X] to restart", 10, 60, 8)
+  elseif game_state == "victory" then
+    print("VICTORY! Press [X] to replay", 10, 60, 8)
+  end
+end
+
+physics={}
+function physics.apply(obj, gravity)
+  obj.vy += gravity
+  obj.x += obj.vx
+  obj.y += obj.vy
+end
+
+
+__gfx__
+00000000004444400044444000444440004444400044444000555550000000000000000000000000000000000000000000000000000000000000000000000000
+0000000004444444044444440444444404444444044444440505550500000000000d0000000800000000d0000000000000000000000000000000000000000000
+0000000004f0f0f404f0f0f404f0f0f404f0f0f404f0f0f40560606500000000d4ddd00000808000000ddd4d0000000000000000000000000000000000000000
+00000000044f8f44044fff44044fff44044fff44044fff440556065500000000dddddd0d08090800d0dddddd0000000000000000000000000000000000000000
+000000000022f2200002f2000002f2000002f2005002f20000d060d00000000000dddddd00858000dddddd000000000000000000000000000000000000000000
+0000000000222220002222200022222000222220532222200d0ddd0d00000000000dddd0000800000dddd0000000000000000000000000000000000000000000
+00000000003222300032223000322230003222306002223000ddddd0000000000000000000050000000000000000000000000000000000000000000000000000
+000000000003030000030300000003000003000000030300000d0d00000000000000000005555500000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00080000000000000c7c7c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0033300000050000c7ccc7c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00333000000500007777777000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00d3d00000050000cc7c7cc000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+003d3000000500000cc7cc0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+003330000006000000ccc00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000066000000c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000003333333333333333444444444444444400000000cccccc77ccccc7cccccccccc000000000000000000000000000000000000000000000000
+0000000000000000333333333333333344f4449444944f4400000000c77cc7777ccc777ccccccccc000000000000000000000000000000000000000000000000
+000000000000000033333333333333334444444444444444000000007777cccccccccccccccccccc000000000000000000000000000000000000000000000000
+000000000000000046444d444f44444446444d44444d444400000000cccccccccccccccccccccccc000000000000000000000000000000000000000000000000
+00000000000000004444444f444494444444444f4444449400000000cccccccccccccccccccccccc000000000000000000000000000000000000000000000000
+00000000000000004d444444444444944d4444444444444400000000cccccccccccccccccccccccc000000000000000000000000000000000000000000000000
+0000000000000000444944444444d444444944444f44d44400000000cccccccccccccccccccccccc000000000000000000000000000000000000000000000000
+0000000000000000d444446444f44444444444444444444400000000cccccccccccccccccccccccc000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000004353535353535353535353434343435343435343434343434353000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000004353435353435353535343434353434343435343434353434353000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000004343534343534353535343534343434353434343534343435353000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000005343534353535353534343434343534343434343435343435353000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000004353435343534353534343435343434353435343535343535343000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000004353435353535353534343434343534343434343435353435353000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000004353534353435353435353534343435343434353434343435353000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000004353435353535353434353534343434343534343434353435353000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000005353534353534353534343435343534343534343534343434353000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000004343535353535343434343534343434343434343434343435353000000000000000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+00000000000000000000000000000000000000004353534353534353534353532143535353435343535353435353000000000000000000000000000000000000
+__map__
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000323332333233323332333233323332333233323332333233323300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000343534343434343434343434343434343434343434343434353500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000343534343534343434343434343434343434343434343434353500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000343534343434343434343535343434343434343434343435353500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000343534343435343434343535343434343434343434343435353500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000343534343435343434343434343434343434343434343435353500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000343534343435343535353534343434343434343434343434353500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000343534353435353534343434343534343435343435343535353500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000343435353534353435353535353435343434343434343435353500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000343535353435353534353535353535343435343534343434343500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000353435343435343434353535343434353434353434343534353400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+__sfx__
+0110000000472004620c3400c34318470004311842500415003700c30500375183750c3000c3751f4730c375053720536211540114330c37524555247120c3730a470163521d07522375164120a211220252e315
+01100000183732440518433394033c65539403185432b543184733940318433394033c655306053940339403184733940318423394033c655394031845321433184733940318473394033c655394033940339403
+01100000247552775729755277552475527755297512775524755277552b755277552475527757297552775720755247572775524757207552475227755247522275526757297552675722752267522975526751
+01100000001750c055003550c055001750c055003550c05500175180650c06518065001750c065003650c065051751106505365110650c17518075003650c0650a145160750a34516075111451d075113451d075
+011000001b5771f55722537265171b5361f52622515265121b7771f76722757267471b7461f7362271522712185771b5571d53722517187361b7261d735227122454527537295252e5171d73514745227452e745
+01100000275422754227542275422e5412e5452b7412b5422b5452b54224544245422754229541295422954224742277422e7422b7422b5422b5472954227542295422b742307422e5422e7472b547305462e742
+0110000030555307652e5752b755295622e7722b752277622707227561297522b072295472774224042275421b4421b5451b5421b4421d542295471d442295422444624546245472444727546275462944729547
+0110000000200002000020000200002000020000200002000020000200002000020000200002000020000200110171d117110171d227131211f227130371f2370f0411b1470f2471b35716051221571626722367
+001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002e775000002e1752e075000002e1752e77500000
+__music__
+00 00044208
+00 00044108
+00 00010304
+00 00010304
+01 00010203
+00 00010203
+00 00010305
+00 00010306
+00 00010305
+00 00010306
+00 00010245
+02 00010243
+
